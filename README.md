@@ -20,6 +20,7 @@ go run ./cmd/meshcore
 - `POST /v1/services/{service}/instances/{instance}/heartbeat`：在 `X-Meshcore-Lease` 头中携带令牌续期，成功返回 204，过期时间从受理时重新计算。
 - `DELETE /v1/services/{service}/instances/{instance}`：携带同一令牌注销，成功返回 204。实例不存在或已过期返回 404 `instance_not_found`；令牌缺失或不匹配返回 409 `lease_conflict`。
 - `GET /v1/discovery/{service}`：返回当前快照，可用 `version`、`zone` 查询参数精确筛选；`instances` 按实例名字典序排列，未知服务返回 200 与空列表。
+- `GET /v1/resolve/{service}?key=...`：按请求键用加权一致性哈希（weighted rendezvous hashing）从当前快照中选择单个实例，返回 `{service, key, instance}`，其中 `instance` 与发现接口的实例表示相同（不含 `leaseToken`）。`key` 必填且仅可出现一次，URL 解码后须为合法 UTF-8、长度 1–256 字节；`version`、`zone` 与发现接口一致，每个参数至多出现一次且非空。选择结果只依赖键、实例名与权重：登记顺序与其他服务变化不影响结果；删除一个实例只迁移原先落在它上面的键，新增一个实例只会把键迁移到新实例；同名同权重覆盖不改变键归属，但 endpoint、metadata、`expiresAt` 等更新照常反映，权重变化视为拓扑变化。无匹配的存活实例时返回 503 `no_available_instance`，不回退到其他版本或故障域；解析不创建也不延长租约。
 
 service 与 instance 名称限 1–64 个 ASCII 字母、数字、点、下划线或连字符。无效参数返回 400 `validation_error`，已知资源的其他方法返回 405 并设置 `Allow`。
 
