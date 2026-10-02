@@ -20,13 +20,19 @@ var namePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func validName(s string) bool { return namePattern.MatchString(s) }
 
+type healthPolicyRequest struct {
+	FailureThreshold *int `json:"failureThreshold"`
+	SuccessThreshold *int `json:"successThreshold"`
+}
+
 type registerRequest struct {
-	Endpoint   string            `json:"endpoint"`
-	Version    string            `json:"version"`
-	Zone       string            `json:"zone"`
-	Weight     int               `json:"weight"`
-	TTLSeconds int               `json:"ttlSeconds"`
-	Metadata   map[string]string `json:"metadata"`
+	Endpoint     string               `json:"endpoint"`
+	Version      string               `json:"version"`
+	Zone         string               `json:"zone"`
+	Weight       int                  `json:"weight"`
+	TTLSeconds   int                  `json:"ttlSeconds"`
+	Metadata     map[string]string    `json:"metadata"`
+	HealthPolicy *healthPolicyRequest `json:"healthPolicy"`
 }
 
 func (r *registerRequest) valid() bool {
@@ -41,34 +47,46 @@ func (r *registerRequest) valid() bool {
 			return false
 		}
 	}
+	if r.HealthPolicy != nil {
+		p := r.HealthPolicy
+		if p.FailureThreshold == nil || p.SuccessThreshold == nil {
+			return false
+		}
+		if *p.FailureThreshold < 1 || *p.FailureThreshold > 10 ||
+			*p.SuccessThreshold < 1 || *p.SuccessThreshold > 10 {
+			return false
+		}
+	}
 	return true
 }
 
 // instanceView is the public representation of a registered instance. The
 // lease token is deliberately excluded; it only appears in registerResponse.
 type instanceView struct {
-	Service    string            `json:"service"`
-	Instance   string            `json:"instance"`
-	Endpoint   string            `json:"endpoint"`
-	Version    string            `json:"version"`
-	Zone       string            `json:"zone"`
-	Weight     int               `json:"weight"`
-	TTLSeconds int               `json:"ttlSeconds"`
-	Metadata   map[string]string `json:"metadata"`
-	ExpiresAt  string            `json:"expiresAt"`
+	Service      string            `json:"service"`
+	Instance     string            `json:"instance"`
+	Endpoint     string            `json:"endpoint"`
+	Version      string            `json:"version"`
+	Zone         string            `json:"zone"`
+	Weight       int               `json:"weight"`
+	TTLSeconds   int               `json:"ttlSeconds"`
+	Metadata     map[string]string `json:"metadata"`
+	ExpiresAt    string            `json:"expiresAt"`
+	HealthStatus string            `json:"healthStatus"`
 }
 
 func viewOf(inst instance) instanceView {
 	return instanceView{
-		Service:    inst.Service,
-		Instance:   inst.Instance,
-		Endpoint:   inst.Endpoint,
-		Version:    inst.Version,
-		Zone:       inst.Zone,
-		Weight:     inst.Weight,
-		TTLSeconds: inst.TTLSeconds,
-		Metadata:   inst.Metadata,
-		ExpiresAt:  inst.expiresAt.UTC().Format(time.RFC3339),
+		Service:      inst.Service,
+		Instance:     inst.Instance,
+		Endpoint:     inst.Endpoint,
+		Version:      inst.Version,
+		Zone:         inst.Zone,
+		Weight:       inst.Weight,
+		TTLSeconds:   inst.TTLSeconds,
+		Metadata:     inst.Metadata,
+		ExpiresAt:    inst.expiresAt.UTC().Format(time.RFC3339),
+		HealthStatus: inst.healthStatus(),
 	}
 }
 
@@ -138,6 +156,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		TTLSeconds: req.TTLSeconds,
 		Metadata:   metadata,
 	}
+	if p := req.HealthPolicy; p != nil {
+		inst.health = healthState{
+			configured:       true,
+			failureThreshold: *p.FailureThreshold,
+			successThreshold: *p.SuccessThreshold,
+			status:           healthHealthy,
+		}
+	}
 	stored, overwritten := s.registry.register(inst, s.now())
 	status := http.StatusCreated
 	if overwritten {
@@ -180,6 +206,62 @@ func writeLeaseResult(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "instance_not_found")
 	case errors.Is(err, errLeaseConflict):
 		writeError(w, http.StatusConflict, "lease_conflict")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+// healthReportRequest is the body of a health report. Pointers distinguish
+// an absent field from a zero value; both fields are required.
+type healthReportRequest struct {
+	Sequence *int64  `json:"sequence"`
+	Status   *string `json:"status"`
+}
+
+// handleHealth serves /v1/services/{service}/instances/{instance}/health.
+// Existence, lease token and policy checks run inside the registry under one
+// lock so concurrent reports, heartbeats and deregistrations stay atomic;
+// the body is decoded up front but its validation error is only surfaced
+// after those checks, matching the documented error precedence.
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service, name := r.PathValue("service"), r.PathValue("instance")
+	if !validName(service) || !validName(name) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	var req healthReportRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	bodyOK := dec.Decode(&req) == nil && dec.Decode(&struct{}{}) == io.EOF &&
+		req.Sequence != nil && *req.Sequence >= 0 &&
+		req.Status != nil && (*req.Status == "pass" || *req.Status == "fail")
+	var seq int64
+	pass := false
+	if bodyOK {
+		seq = *req.Sequence
+		pass = *req.Status == "pass"
+	}
+	err := s.registry.reportHealth(service, name, r.Header.Get(leaseHeader), bodyOK, seq, pass, s.now())
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, errNotFound):
+		writeError(w, http.StatusNotFound, "instance_not_found")
+	case errors.Is(err, errLeaseConflict):
+		writeError(w, http.StatusConflict, "lease_conflict")
+	case errors.Is(err, errHealthDisabled):
+		writeError(w, http.StatusConflict, "health_check_disabled")
+	case errors.Is(err, errInvalidHealthReport):
+		writeError(w, http.StatusBadRequest, "validation_error")
+	case errors.Is(err, errHealthReportConflict):
+		writeError(w, http.StatusConflict, "health_report_conflict")
+	case errors.Is(err, errStaleHealthReport):
+		writeError(w, http.StatusConflict, "stale_health_report")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error")
 	}

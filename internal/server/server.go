@@ -48,6 +48,7 @@ func (s *server) handler() http.Handler {
 	})
 	mux.HandleFunc("/v1/services/{service}/instances/{instance}", s.handleInstance)
 	mux.HandleFunc("/v1/services/{service}/instances/{instance}/heartbeat", s.handleHeartbeat)
+	mux.HandleFunc("/v1/services/{service}/instances/{instance}/health", s.handleHealth)
 	mux.HandleFunc("/v1/discovery/{service}", s.handleDiscovery)
 	mux.HandleFunc("/v1/resolve/{service}", s.handleResolve)
 	return mux

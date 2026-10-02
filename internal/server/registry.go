@@ -11,9 +11,36 @@ import (
 
 // Lease operation outcomes surfaced to the HTTP layer.
 var (
-	errNotFound      = errors.New("instance not found")
-	errLeaseConflict = errors.New("lease conflict")
+	errNotFound             = errors.New("instance not found")
+	errLeaseConflict        = errors.New("lease conflict")
+	errHealthDisabled       = errors.New("health check disabled")
+	errInvalidHealthReport  = errors.New("invalid health report")
+	errHealthReportConflict = errors.New("health report conflict")
+	errStaleHealthReport    = errors.New("stale health report")
 )
+
+// Health statuses exposed in the public instance representation.
+const (
+	healthDisabled  = "disabled"
+	healthHealthy   = "healthy"
+	healthUnhealthy = "unhealthy"
+)
+
+// healthState tracks the optional health policy of an instance and the
+// consecutive-report counters that drive transitions. The zero value is the
+// disabled state: no policy, no reports accepted, always routable.
+type healthState struct {
+	configured       bool
+	failureThreshold int
+	successThreshold int
+	status           string // healthHealthy or healthUnhealthy once configured
+
+	consecutivePass int
+	consecutiveFail int
+	lastSequence    int64
+	lastStatusPass  bool
+	hasSequence     bool
+}
 
 // instance is one registered service instance plus its lease state. The
 // exported fields are set once at registration; token and expiresAt are
@@ -30,9 +57,20 @@ type instance struct {
 
 	token     string
 	expiresAt time.Time
+	health    healthState
 }
 
 func (i *instance) live(now time.Time) bool { return now.Before(i.expiresAt) }
+
+// healthStatus is the public health representation: "disabled" when no
+// health policy was registered, otherwise the current healthy/unhealthy
+// state driven by reported check results.
+func (i *instance) healthStatus() string {
+	if !i.health.configured {
+		return healthDisabled
+	}
+	return i.health.status
+}
 
 // registry holds all live and expired-but-unpurged instances. Expiration is
 // evaluated lazily against the caller's clock, so an expired instance can
@@ -91,6 +129,59 @@ func (r *registry) renew(service, name, token string, now time.Time) error {
 	return nil
 }
 
+// reportHealth applies one health report to a live instance. bodyOK reports
+// whether the request body decoded and validated; it is checked only after
+// existence, token and policy so those errors take precedence. Reports never
+// extend the lease. Sequence handling: a strictly larger sequence advances
+// state; the same sequence with the same status is an idempotent no-op, with
+// a different status a conflict; a smaller sequence is stale.
+func (r *registry) reportHealth(service, name, token string, bodyOK bool, seq int64, pass bool, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	inst := r.lookupLocked(service, name, now)
+	if inst == nil {
+		return errNotFound
+	}
+	if token == "" || token != inst.token {
+		return errLeaseConflict
+	}
+	if !inst.health.configured {
+		return errHealthDisabled
+	}
+	if !bodyOK {
+		return errInvalidHealthReport
+	}
+	h := &inst.health
+	if h.hasSequence {
+		if seq < h.lastSequence {
+			return errStaleHealthReport
+		}
+		if seq == h.lastSequence {
+			if pass == h.lastStatusPass {
+				return nil
+			}
+			return errHealthReportConflict
+		}
+	}
+	h.hasSequence = true
+	h.lastSequence = seq
+	h.lastStatusPass = pass
+	if pass {
+		h.consecutivePass++
+		h.consecutiveFail = 0
+		if h.consecutivePass >= h.successThreshold {
+			h.status = healthHealthy
+		}
+	} else {
+		h.consecutiveFail++
+		h.consecutivePass = 0
+		if h.consecutiveFail >= h.failureThreshold {
+			h.status = healthUnhealthy
+		}
+	}
+	return nil
+}
+
 // deregister removes a live instance whose current token matches.
 func (r *registry) deregister(service, name, token string, now time.Time) error {
 	r.mu.Lock()
@@ -121,13 +212,18 @@ func (r *registry) lookupLocked(service, name string, now time.Time) *instance {
 
 // snapshot returns copies of the live instances of service matching the
 // version/zone filters (empty string disables a filter), sorted by instance
-// name. Copies are taken under the lock so callers can read them race-free.
+// name. Unhealthy instances are excluded from routing and discovery; only
+// healthy or health-disabled instances appear. Copies are taken under the
+// lock so callers can read them race-free.
 func (r *registry) snapshot(service, version, zone string, now time.Time) []instance {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []instance
 	for _, inst := range r.instances[service] {
 		if !inst.live(now) {
+			continue
+		}
+		if inst.health.configured && inst.health.status == healthUnhealthy {
 			continue
 		}
 		if version != "" && inst.Version != version {
