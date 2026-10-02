@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"time"
+	"unicode/utf8"
 )
 
 // leaseHeader carries the lease token on heartbeat and deregister requests.
@@ -79,6 +80,12 @@ type registerResponse struct {
 type discoveryResponse struct {
 	Service   string         `json:"service"`
 	Instances []instanceView `json:"instances"`
+}
+
+type resolveResponse struct {
+	Service  string       `json:"service"`
+	Key      string       `json:"key"`
+	Instance instanceView `json:"instance"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -213,4 +220,58 @@ func (s *server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		views = append(views, viewOf(inst))
 	}
 	writeJSON(w, http.StatusOK, discoveryResponse{Service: service, Instances: views})
+}
+
+// maxKeyBytes bounds the URL-decoded routing key accepted by handleResolve.
+const maxKeyBytes = 256
+
+// handleResolve serves /v1/resolve/{service}: it maps the caller's routing
+// key onto a single live instance via consistent hashing. The selection is
+// computed from the current snapshot only; it never creates or extends a
+// lease.
+func (s *server) handleResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service := r.PathValue("service")
+	if !validName(service) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	var key, version, zone string
+	for param, values := range query {
+		if len(values) != 1 || values[0] == "" {
+			writeError(w, http.StatusBadRequest, "validation_error")
+			return
+		}
+		switch param {
+		case "key":
+			key = values[0]
+		case "version":
+			version = values[0]
+		case "zone":
+			zone = values[0]
+		default:
+			writeError(w, http.StatusBadRequest, "validation_error")
+			return
+		}
+	}
+	if key == "" || len(key) > maxKeyBytes || !utf8.ValidString(key) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	instances := s.registry.snapshot(service, version, zone, s.now())
+	chosen, ok := selectInstance(key, instances)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "no_available_instance")
+		return
+	}
+	writeJSON(w, http.StatusOK, resolveResponse{Service: service, Key: key, Instance: viewOf(chosen)})
 }
