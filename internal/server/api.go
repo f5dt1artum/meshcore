@@ -1,0 +1,216 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"time"
+)
+
+// leaseHeader carries the lease token on heartbeat and deregister requests.
+const leaseHeader = "X-Meshcore-Lease"
+
+// namePattern constrains service and instance names: 1-64 ASCII letters,
+// digits, dots, underscores or hyphens.
+var namePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func validName(s string) bool { return namePattern.MatchString(s) }
+
+type registerRequest struct {
+	Endpoint   string            `json:"endpoint"`
+	Version    string            `json:"version"`
+	Zone       string            `json:"zone"`
+	Weight     int               `json:"weight"`
+	TTLSeconds int               `json:"ttlSeconds"`
+	Metadata   map[string]string `json:"metadata"`
+}
+
+func (r *registerRequest) valid() bool {
+	if r.Endpoint == "" || r.Version == "" || r.Zone == "" {
+		return false
+	}
+	if r.Weight < 1 || r.Weight > 100 || r.TTLSeconds < 1 || r.TTLSeconds > 300 {
+		return false
+	}
+	for k, v := range r.Metadata {
+		if k == "" || v == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// instanceView is the public representation of a registered instance. The
+// lease token is deliberately excluded; it only appears in registerResponse.
+type instanceView struct {
+	Service    string            `json:"service"`
+	Instance   string            `json:"instance"`
+	Endpoint   string            `json:"endpoint"`
+	Version    string            `json:"version"`
+	Zone       string            `json:"zone"`
+	Weight     int               `json:"weight"`
+	TTLSeconds int               `json:"ttlSeconds"`
+	Metadata   map[string]string `json:"metadata"`
+	ExpiresAt  string            `json:"expiresAt"`
+}
+
+func viewOf(inst instance) instanceView {
+	return instanceView{
+		Service:    inst.Service,
+		Instance:   inst.Instance,
+		Endpoint:   inst.Endpoint,
+		Version:    inst.Version,
+		Zone:       inst.Zone,
+		Weight:     inst.Weight,
+		TTLSeconds: inst.TTLSeconds,
+		Metadata:   inst.Metadata,
+		ExpiresAt:  inst.expiresAt.UTC().Format(time.RFC3339),
+	}
+}
+
+type registerResponse struct {
+	instanceView
+	LeaseToken string `json:"leaseToken"`
+}
+
+type discoveryResponse struct {
+	Service   string         `json:"service"`
+	Instances []instanceView `json:"instances"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, code string) {
+	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code}})
+}
+
+// handleInstance serves /v1/services/{service}/instances/{instance}.
+func (s *server) handleInstance(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPut:
+		s.register(w, r)
+	case http.MethodDelete:
+		s.deregister(w, r)
+	default:
+		w.Header().Set("Allow", "PUT, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+	}
+}
+
+func (s *server) register(w http.ResponseWriter, r *http.Request) {
+	service, name := r.PathValue("service"), r.PathValue("instance")
+	if !validName(service) || !validName(name) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	var req registerRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || dec.Decode(&struct{}{}) != io.EOF || !req.valid() {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	metadata := make(map[string]string, len(req.Metadata))
+	for k, v := range req.Metadata {
+		metadata[k] = v
+	}
+	inst := &instance{
+		Service:    service,
+		Instance:   name,
+		Endpoint:   req.Endpoint,
+		Version:    req.Version,
+		Zone:       req.Zone,
+		Weight:     req.Weight,
+		TTLSeconds: req.TTLSeconds,
+		Metadata:   metadata,
+	}
+	stored, overwritten := s.registry.register(inst, s.now())
+	status := http.StatusCreated
+	if overwritten {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, registerResponse{instanceView: viewOf(stored), LeaseToken: stored.token})
+}
+
+func (s *server) deregister(w http.ResponseWriter, r *http.Request) {
+	service, name := r.PathValue("service"), r.PathValue("instance")
+	if !validName(service) || !validName(name) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	err := s.registry.deregister(service, name, r.Header.Get(leaseHeader), s.now())
+	writeLeaseResult(w, err)
+}
+
+// handleHeartbeat serves /v1/services/{service}/instances/{instance}/heartbeat.
+func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service, name := r.PathValue("service"), r.PathValue("instance")
+	if !validName(service) || !validName(name) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	err := s.registry.renew(service, name, r.Header.Get(leaseHeader), s.now())
+	writeLeaseResult(w, err)
+}
+
+func writeLeaseResult(w http.ResponseWriter, err error) {
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, errNotFound):
+		writeError(w, http.StatusNotFound, "instance_not_found")
+	case errors.Is(err, errLeaseConflict):
+		writeError(w, http.StatusConflict, "lease_conflict")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+// handleDiscovery serves /v1/discovery/{service}.
+func (s *server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service := r.PathValue("service")
+	if !validName(service) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	var version, zone string
+	for key, values := range query {
+		if (key != "version" && key != "zone") || len(values) != 1 || values[0] == "" {
+			writeError(w, http.StatusBadRequest, "validation_error")
+			return
+		}
+		if key == "version" {
+			version = values[0]
+		} else {
+			zone = values[0]
+		}
+	}
+	instances := s.registry.snapshot(service, version, zone, s.now())
+	views := make([]instanceView, 0, len(instances))
+	for _, inst := range instances {
+		views = append(views, viewOf(inst))
+	}
+	writeJSON(w, http.StatusOK, discoveryResponse{Service: service, Instances: views})
+}
