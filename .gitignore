@@ -1,0 +1,16 @@
+/bin/
+/dist/
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Dependency and build output. These are not answer code and must never be committed. One side ran
+# `go mod vendor` before sealing, which put third-party source into its sealed commit and tripped the
+# size guard. Ignoring them here keeps them out of the sealed commit, out of the baseline, and out of
+# the published delivery from one place.
+/vendor/
+/node_modules/
+/__pycache__/
+/.venv/
