@@ -86,6 +86,8 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		})
 	case errors.Is(err, errNoRoutableInstance):
 		writeError(w, http.StatusServiceUnavailable, "no_available_instance")
+	case errors.Is(err, errCircuitOpen):
+		writeError(w, http.StatusServiceUnavailable, "circuit_open")
 	case errors.Is(err, errConcurrencyLimited):
 		writeError(w, http.StatusTooManyRequests, "concurrency_limited")
 	default:
@@ -114,4 +116,49 @@ func (s *server) handlePermit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// completeRequest is the body of POST
+// /v1/admission/{service}/permits/{permitToken}/complete. The pointer
+// distinguishes an absent outcome from an empty string; the only accepted
+// values are "success" and "failure".
+type completeRequest struct {
+	Outcome *string `json:"outcome"`
+}
+
+// handleComplete serves the permit completion endpoint. A valid permit is
+// settled with its outcome, its slot freed and its token invalidated; the
+// outcome feeds the circuit breaker of the permit's instance. The body is
+// decoded up front but its validation error is only surfaced after the
+// permit existence and service checks, matching the documented error
+// precedence.
+func (s *server) handleComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service := r.PathValue("service")
+	if !validName(service) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	token := r.PathValue("permitToken")
+	var req completeRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	bodyOK := dec.Decode(&req) == nil && dec.Decode(&struct{}{}) == io.EOF &&
+		req.Outcome != nil && (*req.Outcome == "success" || *req.Outcome == "failure")
+	success := bodyOK && *req.Outcome == "success"
+	err := s.registry.complete(service, token, bodyOK, success, s.now())
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, errPermitNotFound):
+		writeError(w, http.StatusNotFound, "permit_not_found")
+	case errors.Is(err, errInvalidCompletion):
+		writeError(w, http.StatusBadRequest, "validation_error")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error")
+	}
 }

@@ -25,15 +25,21 @@ type healthPolicyRequest struct {
 	SuccessThreshold *int `json:"successThreshold"`
 }
 
+type circuitBreakerRequest struct {
+	FailureThreshold *int `json:"failureThreshold"`
+	OpenSeconds      *int `json:"openSeconds"`
+}
+
 type registerRequest struct {
-	Endpoint       string               `json:"endpoint"`
-	Version        string               `json:"version"`
-	Zone           string               `json:"zone"`
-	Weight         int                  `json:"weight"`
-	TTLSeconds     int                  `json:"ttlSeconds"`
-	Metadata       map[string]string    `json:"metadata"`
-	HealthPolicy   *healthPolicyRequest `json:"healthPolicy"`
-	MaxConcurrency *int                 `json:"maxConcurrency"`
+	Endpoint       string                 `json:"endpoint"`
+	Version        string                 `json:"version"`
+	Zone           string                 `json:"zone"`
+	Weight         int                    `json:"weight"`
+	TTLSeconds     int                    `json:"ttlSeconds"`
+	Metadata       map[string]string      `json:"metadata"`
+	HealthPolicy   *healthPolicyRequest   `json:"healthPolicy"`
+	MaxConcurrency *int                   `json:"maxConcurrency"`
+	CircuitBreaker *circuitBreakerRequest `json:"circuitBreaker"`
 }
 
 func (r *registerRequest) valid() bool {
@@ -58,6 +64,16 @@ func (r *registerRequest) valid() bool {
 		}
 		if *p.FailureThreshold < 1 || *p.FailureThreshold > 10 ||
 			*p.SuccessThreshold < 1 || *p.SuccessThreshold > 10 {
+			return false
+		}
+	}
+	if r.CircuitBreaker != nil {
+		cb := r.CircuitBreaker
+		if cb.FailureThreshold == nil || cb.OpenSeconds == nil {
+			return false
+		}
+		if *cb.FailureThreshold < 1 || *cb.FailureThreshold > 20 ||
+			*cb.OpenSeconds < 1 || *cb.OpenSeconds > 300 {
 			return false
 		}
 	}
@@ -173,6 +189,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			failureThreshold: *p.FailureThreshold,
 			successThreshold: *p.SuccessThreshold,
 			status:           healthHealthy,
+		}
+	}
+	if cb := req.CircuitBreaker; cb != nil {
+		inst.circuit = circuitState{
+			configured:       true,
+			failureThreshold: *cb.FailureThreshold,
+			openSeconds:      *cb.OpenSeconds,
+			state:            circuitClosed,
 		}
 	}
 	stored, overwritten := s.registry.register(inst, s.now())

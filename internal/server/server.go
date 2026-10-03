@@ -53,5 +53,6 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("/v1/resolve/{service}", s.handleResolve)
 	mux.HandleFunc("/v1/admission/{service}/acquire", s.handleAcquire)
 	mux.HandleFunc("/v1/admission/{service}/permits/{permitToken}", s.handlePermit)
+	mux.HandleFunc("/v1/admission/{service}/permits/{permitToken}/complete", s.handleComplete)
 	return mux
 }

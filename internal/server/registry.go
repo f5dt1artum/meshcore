@@ -19,7 +19,9 @@ var (
 	errStaleHealthReport    = errors.New("stale health report")
 	errNoRoutableInstance   = errors.New("no routable instance")
 	errConcurrencyLimited   = errors.New("concurrency limited")
+	errCircuitOpen          = errors.New("circuit open")
 	errPermitNotFound       = errors.New("permit not found")
+	errInvalidCompletion    = errors.New("invalid completion")
 )
 
 // Health statuses exposed in the public instance representation.
@@ -45,7 +47,55 @@ type healthState struct {
 	hasSequence     bool
 }
 
-// instance is one registered service instance plus its lease state. The
+// Circuit breaker states of an instance with a circuitBreaker policy. The
+// zero value is the unconfigured state: no policy, never blocked.
+const (
+	circuitClosed   = "closed"
+	circuitOpen     = "open"
+	circuitHalfOpen = "half_open"
+)
+
+// circuitState tracks the optional circuit breaker policy of an instance.
+// Consecutive failed completions in the closed state open the circuit for
+// openSeconds; afterwards a single probe permit decides whether the circuit
+// closes again or reopens. The zero value is the unconfigured state, which
+// keeps the pre-existing admission behaviour.
+type circuitState struct {
+	configured       bool
+	failureThreshold int
+	openSeconds      int
+	state            string // circuitClosed, circuitOpen or circuitHalfOpen once configured
+
+	consecutiveFail  int
+	openUntil        time.Time
+	probeOutstanding bool // a half-open probe permit is currently out
+}
+
+// blockedFor reports whether the instance may not receive a new permit at
+// now, lazily advancing an expired open circuit to half-open. probe is set
+// when a permit granted now would be the half-open probe. Callers must hold
+// r.mu.
+func (c *circuitState) blockedFor(now time.Time) (blocked, probe bool) {
+	if !c.configured {
+		return false, false
+	}
+	switch c.state {
+	case circuitOpen:
+		if now.Before(c.openUntil) {
+			return true, false
+		}
+		c.state = circuitHalfOpen
+		return false, true
+	case circuitHalfOpen:
+		if c.probeOutstanding {
+			return true, false
+		}
+		return false, true
+	default: // circuitClosed
+		return false, false
+	}
+}
+
 // exported fields are set once at registration; token and expiresAt are
 // mutated under the registry lock.
 type instance struct {
@@ -62,6 +112,7 @@ type instance struct {
 	token     string
 	expiresAt time.Time
 	health    healthState
+	circuit   circuitState
 }
 
 func (i *instance) live(now time.Time) bool { return now.Before(i.expiresAt) }
@@ -85,6 +136,7 @@ type permit struct {
 	service   string
 	inst      *instance
 	expiresAt time.Time
+	probe     bool // granted as the half-open probe of inst's circuit
 }
 
 // registry holds all live and expired-but-unpurged instances. Expiration is
@@ -284,7 +336,8 @@ func (r *registry) dropPermitLocked(p *permit) {
 // prunePermitsLocked discards every permit that is no longer valid at now:
 // permits past their own expiry and permits bound to an instance whose lease
 // has expired. Overwritten and deregistered instances are removed eagerly by
-// their callers. Callers must hold r.mu.
+// their callers. An expired probe permit re-opens its circuit. Callers must
+// hold r.mu.
 func (r *registry) prunePermitsLocked(now time.Time) {
 	for token, p := range r.permits {
 		if !now.Before(p.expiresAt) || !p.inst.live(now) {
@@ -294,7 +347,20 @@ func (r *registry) prunePermitsLocked(now time.Time) {
 			} else {
 				delete(r.inUse, p.inst)
 			}
+			r.reopenIfProbeLocked(p, now)
 		}
+	}
+}
+
+// reopenIfProbeLocked re-opens the circuit when a half-open probe permit
+// ends without a completion outcome (released or expired). Callers must hold
+// r.mu.
+func (r *registry) reopenIfProbeLocked(p *permit, now time.Time) {
+	c := &p.inst.circuit
+	if c.configured && p.probe && c.state == circuitHalfOpen {
+		c.state = circuitOpen
+		c.probeOutstanding = false
+		c.openUntil = now.Add(time.Duration(c.openSeconds) * time.Second)
 	}
 }
 
@@ -327,11 +393,14 @@ type acquiredPermit struct {
 // slot on it. Candidates are the live, non-unhealthy instances of service
 // matching the version/zone filters, ranked by the same weighted rendezvous
 // score used by resolve, best first; the first-ranked candidate with a free
-// slot wins. Unbounded instances (MaxConcurrency == 0) always admit. The
-// lookup and the occupancy happen under one lock, so the number of valid
-// permits can never exceed an instance's quota. It returns
-// errNoRoutableInstance when the filter matches nothing and
-// errConcurrencyLimited when every match is at capacity.
+// slot wins. Unbounded instances (MaxConcurrency == 0) always admit.
+// Instances whose circuit is open, or half-open with a probe already out,
+// are skipped in rank order; a half-open circuit grants its single probe
+// permit to the first acquire that reaches it. The lookup and the occupancy
+// happen under one lock, so the number of valid permits can never exceed an
+// instance's quota. It returns errNoRoutableInstance when the filter matches
+// nothing, errCircuitOpen when every match is blocked only by its circuit,
+// and errConcurrencyLimited when every circuit-passing match is at capacity.
 func (r *registry) acquire(service, key, version, zone string, ttl time.Duration, now time.Time) (acquiredPermit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -367,10 +436,27 @@ func (r *registry) acquire(service, key, version, zone string, ttl time.Duration
 		return candidates[a].Instance < candidates[b].Instance
 	})
 
-	var chosen *instance
+	// Drop candidates blocked by their circuit, keeping rank order.
+	type eligible struct {
+		inst  *instance
+		probe bool
+	}
+	var passing []eligible
 	for _, cand := range candidates {
+		blocked, probe := cand.circuit.blockedFor(now)
+		if !blocked {
+			passing = append(passing, eligible{inst: cand, probe: probe})
+		}
+	}
+	if len(passing) == 0 {
+		return acquiredPermit{}, errCircuitOpen
+	}
+
+	var chosen *eligible
+	for i := range passing {
+		cand := passing[i].inst
 		if cand.MaxConcurrency == 0 || r.inUse[cand] < cand.MaxConcurrency {
-			chosen = cand
+			chosen = &passing[i]
 			break
 		}
 	}
@@ -389,16 +475,21 @@ func (r *registry) acquire(service, key, version, zone string, ttl time.Duration
 	r.permits[token] = &permit{
 		token:     token,
 		service:   service,
-		inst:      chosen,
+		inst:      chosen.inst,
 		expiresAt: expiresAt,
+		probe:     chosen.probe,
 	}
-	r.inUse[chosen]++
-	return acquiredPermit{inst: *chosen, token: token, expiresAt: expiresAt}, nil
+	r.inUse[chosen.inst]++
+	if chosen.probe {
+		chosen.inst.circuit.probeOutstanding = true
+	}
+	return acquiredPermit{inst: *chosen.inst, token: token, expiresAt: expiresAt}, nil
 }
 
 // release releases a valid permit granted for service. Unknown tokens,
 // expired permits, tokens bound to another service and permits invalidated
 // by overwrite, deregistration or lease expiry all return errPermitNotFound.
+// Releasing a half-open probe permit re-opens its circuit.
 func (r *registry) release(service, token string, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -408,5 +499,58 @@ func (r *registry) release(service, token string, now time.Time) error {
 		return errPermitNotFound
 	}
 	r.dropPermitLocked(p)
+	r.reopenIfProbeLocked(p, now)
+	return nil
+}
+
+// complete settles a valid permit granted for service with a success or
+// failure outcome, freeing its slot and invalidating the token. Existence
+// and service checks run before the body validation so errPermitNotFound
+// takes precedence, matching the health-report error ordering. Completions
+// drive the circuit of the permit's instance: in the closed state a failure
+// extends the consecutive-failure streak (opening the circuit at the
+// threshold) and a success resets it; a probe completion closes the circuit
+// on success and re-opens it on failure; completions while the circuit is
+// open only free the slot.
+func (r *registry) complete(service, token string, bodyOK, success bool, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prunePermitsLocked(now)
+	p, ok := r.permits[token]
+	if !ok || p.service != service {
+		return errPermitNotFound
+	}
+	if !bodyOK {
+		return errInvalidCompletion
+	}
+	r.dropPermitLocked(p)
+	c := &p.inst.circuit
+	if !c.configured {
+		return nil
+	}
+	switch {
+	case p.probe:
+		// The half-open probe decides the circuit on its own.
+		c.probeOutstanding = false
+		if success {
+			c.state = circuitClosed
+			c.consecutiveFail = 0
+		} else {
+			c.state = circuitOpen
+			c.openUntil = now.Add(time.Duration(c.openSeconds) * time.Second)
+		}
+	case c.state == circuitClosed:
+		if success {
+			c.consecutiveFail = 0
+		} else {
+			c.consecutiveFail++
+			if c.consecutiveFail >= c.failureThreshold {
+				c.state = circuitOpen
+				c.consecutiveFail = 0
+				c.openUntil = now.Add(time.Duration(c.openSeconds) * time.Second)
+			}
+		}
+	}
+	// Open and (non-probe) half-open completions only free the slot.
 	return nil
 }
