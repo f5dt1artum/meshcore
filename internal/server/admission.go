@@ -90,6 +90,8 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "circuit_open")
 	case errors.Is(err, errConcurrencyLimited):
 		writeError(w, http.StatusTooManyRequests, "concurrency_limited")
+	case errors.Is(err, errRateLimited):
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error")
 	}

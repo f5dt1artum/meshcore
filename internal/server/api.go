@@ -30,6 +30,11 @@ type circuitBreakerRequest struct {
 	OpenSeconds      *int `json:"openSeconds"`
 }
 
+type rateLimitRequest struct {
+	RequestsPerSecond *int `json:"requestsPerSecond"`
+	Burst             *int `json:"burst"`
+}
+
 type registerRequest struct {
 	Endpoint       string                 `json:"endpoint"`
 	Version        string                 `json:"version"`
@@ -40,6 +45,7 @@ type registerRequest struct {
 	HealthPolicy   *healthPolicyRequest   `json:"healthPolicy"`
 	MaxConcurrency *int                   `json:"maxConcurrency"`
 	CircuitBreaker *circuitBreakerRequest `json:"circuitBreaker"`
+	RateLimit      *rateLimitRequest      `json:"rateLimit"`
 }
 
 func (r *registerRequest) valid() bool {
@@ -77,13 +83,30 @@ func (r *registerRequest) valid() bool {
 			return false
 		}
 	}
+	if r.RateLimit != nil {
+		rl := r.RateLimit
+		if rl.RequestsPerSecond == nil || rl.Burst == nil {
+			return false
+		}
+		if *rl.RequestsPerSecond < 1 || *rl.RequestsPerSecond > 10000 ||
+			*rl.Burst < 1 || *rl.Burst > 10000 {
+			return false
+		}
+	}
 	return true
+}
+
+// rateLimitView is the public echo of a configured token-bucket policy.
+type rateLimitView struct {
+	RequestsPerSecond int `json:"requestsPerSecond"`
+	Burst             int `json:"burst"`
 }
 
 // instanceView is the public representation of a registered instance. The
 // lease token is deliberately excluded; it only appears in registerResponse.
 // MaxConcurrency is omitted for instances registered without a cap, where
-// concurrency is unbounded.
+// concurrency is unbounded. RateLimit is omitted for instances registered
+// without a policy, where admission is never rate limited.
 type instanceView struct {
 	Service        string            `json:"service"`
 	Instance       string            `json:"instance"`
@@ -96,10 +119,11 @@ type instanceView struct {
 	ExpiresAt      string            `json:"expiresAt"`
 	HealthStatus   string            `json:"healthStatus"`
 	MaxConcurrency int               `json:"maxConcurrency,omitempty"`
+	RateLimit      *rateLimitView    `json:"rateLimit,omitempty"`
 }
 
 func viewOf(inst instance) instanceView {
-	return instanceView{
+	v := instanceView{
 		Service:        inst.Service,
 		Instance:       inst.Instance,
 		Endpoint:       inst.Endpoint,
@@ -112,6 +136,13 @@ func viewOf(inst instance) instanceView {
 		HealthStatus:   inst.healthStatus(),
 		MaxConcurrency: inst.MaxConcurrency,
 	}
+	if inst.rateLimit.configured {
+		v.RateLimit = &rateLimitView{
+			RequestsPerSecond: inst.rateLimit.requestsPerSecond,
+			Burst:             inst.rateLimit.burst,
+		}
+	}
+	return v
 }
 
 type registerResponse struct {
@@ -197,6 +228,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			failureThreshold: *cb.FailureThreshold,
 			openSeconds:      *cb.OpenSeconds,
 			state:            circuitClosed,
+		}
+	}
+	if rl := req.RateLimit; rl != nil {
+		inst.rateLimit = rateLimitState{
+			configured:        true,
+			requestsPerSecond: *rl.RequestsPerSecond,
+			burst:             *rl.Burst,
 		}
 	}
 	stored, overwritten := s.registry.register(inst, s.now())
