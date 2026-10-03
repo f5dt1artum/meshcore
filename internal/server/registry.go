@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Lease operation outcomes surfaced to the HTTP layer.
+// Lease and admission outcomes surfaced to the HTTP layer.
 var (
 	errNotFound             = errors.New("instance not found")
 	errLeaseConflict        = errors.New("lease conflict")
@@ -17,6 +17,9 @@ var (
 	errInvalidHealthReport  = errors.New("invalid health report")
 	errHealthReportConflict = errors.New("health report conflict")
 	errStaleHealthReport    = errors.New("stale health report")
+	errNoRoutableInstance   = errors.New("no routable instance")
+	errConcurrencyLimited   = errors.New("concurrency limited")
+	errPermitNotFound       = errors.New("permit not found")
 )
 
 // Health statuses exposed in the public instance representation.
@@ -46,14 +49,15 @@ type healthState struct {
 // exported fields are set once at registration; token and expiresAt are
 // mutated under the registry lock.
 type instance struct {
-	Service    string
-	Instance   string
-	Endpoint   string
-	Version    string
-	Zone       string
-	Weight     int
-	TTLSeconds int
-	Metadata   map[string]string
+	Service        string
+	Instance       string
+	Endpoint       string
+	Version        string
+	Zone           string
+	Weight         int
+	TTLSeconds     int
+	Metadata       map[string]string
+	MaxConcurrency int // zero means unbounded
 
 	token     string
 	expiresAt time.Time
@@ -72,18 +76,37 @@ func (i *instance) healthStatus() string {
 	return i.health.status
 }
 
+// permit is one outstanding short-lived admission permit. It references the
+// exact instance record it was granted against, so overwriting,
+// deregistering or losing the lease of that record invalidates the permit
+// immediately even though the permit itself has not yet expired.
+type permit struct {
+	token     string
+	service   string
+	inst      *instance
+	expiresAt time.Time
+}
+
 // registry holds all live and expired-but-unpurged instances. Expiration is
 // evaluated lazily against the caller's clock, so an expired instance can
 // never reappear in snapshots or be revived by a stale lease token.
 type registry struct {
 	mu        sync.Mutex
 	instances map[string]map[string]*instance // service -> instance name -> record
+	permits   map[string]*permit              // outstanding permits by opaque token
+	inUse     map[*instance]int               // unexpired permits counted per record
 }
 
 func newRegistry() *registry {
-	return &registry{instances: make(map[string]map[string]*instance)}
+	return &registry{
+		instances: make(map[string]map[string]*instance),
+		permits:   make(map[string]*permit),
+		inUse:     make(map[*instance]int),
+	}
 }
 
+// newLeaseToken mints a random opaque token. Lease and permit tokens share
+// the shape but live in independent namespaces.
 func newLeaseToken() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -91,6 +114,9 @@ func newLeaseToken() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// newPermitToken mints the unique opaque token identifying one permit.
+func newPermitToken() string { return newLeaseToken() }
 
 // register inserts inst, replacing any previous record with the same name and
 // minting a fresh lease token (the old token stops matching immediately). It
@@ -107,8 +133,13 @@ func (r *registry) register(inst *instance, now time.Time) (instance, bool) {
 		r.instances[inst.Service] = byName
 	}
 	overwritten := false
-	if prev, ok := byName[inst.Instance]; ok && prev.live(now) {
-		overwritten = true
+	if prev, ok := byName[inst.Instance]; ok {
+		if prev.live(now) {
+			overwritten = true
+		}
+		// The replacement is a new instance: permits granted against the
+		// previous record stop being releasable and free its quota at once.
+		r.invalidatePermitsLocked(prev)
 	}
 	byName[inst.Instance] = inst
 	return *inst, overwritten
@@ -193,6 +224,7 @@ func (r *registry) deregister(service, name, token string, now time.Time) error 
 	if token == "" || token != inst.token {
 		return errLeaseConflict
 	}
+	r.invalidatePermitsLocked(inst)
 	delete(r.instances[service], name)
 	if len(r.instances[service]) == 0 {
 		delete(r.instances, service)
@@ -236,4 +268,145 @@ func (r *registry) snapshot(service, version, zone string, now time.Time) []inst
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].Instance < out[b].Instance })
 	return out
+}
+
+// dropPermitLocked removes one permit and releases the quota it occupied on
+// its instance. Callers must hold r.mu.
+func (r *registry) dropPermitLocked(p *permit) {
+	delete(r.permits, p.token)
+	if n := r.inUse[p.inst] - 1; n > 0 {
+		r.inUse[p.inst] = n
+	} else {
+		delete(r.inUse, p.inst)
+	}
+}
+
+// prunePermitsLocked discards every permit that is no longer valid at now:
+// permits past their own expiry and permits bound to an instance whose lease
+// has expired. Overwritten and deregistered instances are removed eagerly by
+// their callers. Callers must hold r.mu.
+func (r *registry) prunePermitsLocked(now time.Time) {
+	for token, p := range r.permits {
+		if !now.Before(p.expiresAt) || !p.inst.live(now) {
+			delete(r.permits, token)
+			if n := r.inUse[p.inst] - 1; n > 0 {
+				r.inUse[p.inst] = n
+			} else {
+				delete(r.inUse, p.inst)
+			}
+		}
+	}
+}
+
+// invalidatePermitsLocked releases every outstanding permit bound to inst.
+// Overwriting or deregistering an instance invalidates its old permits
+// immediately and gives the quota back. Callers must hold r.mu.
+func (r *registry) invalidatePermitsLocked(inst *instance) {
+	for token, p := range r.permits {
+		if p.inst != inst {
+			continue
+		}
+		delete(r.permits, token)
+		if n := r.inUse[inst] - 1; n > 0 {
+			r.inUse[inst] = n
+		} else {
+			delete(r.inUse, inst)
+		}
+	}
+}
+
+// acquiredPermit is the result of a successful admission: a copy of the
+// chosen instance together with the opaque token and its expiry.
+type acquiredPermit struct {
+	inst      instance
+	token     string
+	expiresAt time.Time
+}
+
+// acquire atomically selects an instance for key and occupies one permit
+// slot on it. Candidates are the live, non-unhealthy instances of service
+// matching the version/zone filters, ranked by the same weighted rendezvous
+// score used by resolve, best first; the first-ranked candidate with a free
+// slot wins. Unbounded instances (MaxConcurrency == 0) always admit. The
+// lookup and the occupancy happen under one lock, so the number of valid
+// permits can never exceed an instance's quota. It returns
+// errNoRoutableInstance when the filter matches nothing and
+// errConcurrencyLimited when every match is at capacity.
+func (r *registry) acquire(service, key, version, zone string, ttl time.Duration, now time.Time) (acquiredPermit, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prunePermitsLocked(now)
+
+	var candidates []*instance
+	for _, inst := range r.instances[service] {
+		if !inst.live(now) {
+			continue
+		}
+		if inst.health.configured && inst.health.status == healthUnhealthy {
+			continue
+		}
+		if version != "" && inst.Version != version {
+			continue
+		}
+		if zone != "" && inst.Zone != zone {
+			continue
+		}
+		candidates = append(candidates, inst)
+	}
+	if len(candidates) == 0 {
+		return acquiredPermit{}, errNoRoutableInstance
+	}
+	// Rank by descending rendezvous score; the instance name breaks the
+	// measure-zero tie exactly as selectInstance does.
+	sort.Slice(candidates, func(a, b int) bool {
+		sa := rendezvousScore(key, candidates[a].Instance, candidates[a].Weight)
+		sb := rendezvousScore(key, candidates[b].Instance, candidates[b].Weight)
+		if sa != sb {
+			return sa > sb
+		}
+		return candidates[a].Instance < candidates[b].Instance
+	})
+
+	var chosen *instance
+	for _, cand := range candidates {
+		if cand.MaxConcurrency == 0 || r.inUse[cand] < cand.MaxConcurrency {
+			chosen = cand
+			break
+		}
+	}
+	if chosen == nil {
+		return acquiredPermit{}, errConcurrencyLimited
+	}
+
+	token := newPermitToken()
+	for {
+		if _, taken := r.permits[token]; !taken {
+			break
+		}
+		token = newPermitToken()
+	}
+	expiresAt := now.Add(ttl)
+	r.permits[token] = &permit{
+		token:     token,
+		service:   service,
+		inst:      chosen,
+		expiresAt: expiresAt,
+	}
+	r.inUse[chosen]++
+	return acquiredPermit{inst: *chosen, token: token, expiresAt: expiresAt}, nil
+}
+
+// release releases a valid permit granted for service. Unknown tokens,
+// expired permits, tokens bound to another service and permits invalidated
+// by overwrite, deregistration or lease expiry all return errPermitNotFound.
+func (r *registry) release(service, token string, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prunePermitsLocked(now)
+	p, ok := r.permits[token]
+	if !ok || p.service != service {
+		return errPermitNotFound
+	}
+	r.dropPermitLocked(p)
+	return nil
 }

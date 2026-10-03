@@ -26,13 +26,14 @@ type healthPolicyRequest struct {
 }
 
 type registerRequest struct {
-	Endpoint     string               `json:"endpoint"`
-	Version      string               `json:"version"`
-	Zone         string               `json:"zone"`
-	Weight       int                  `json:"weight"`
-	TTLSeconds   int                  `json:"ttlSeconds"`
-	Metadata     map[string]string    `json:"metadata"`
-	HealthPolicy *healthPolicyRequest `json:"healthPolicy"`
+	Endpoint       string               `json:"endpoint"`
+	Version        string               `json:"version"`
+	Zone           string               `json:"zone"`
+	Weight         int                  `json:"weight"`
+	TTLSeconds     int                  `json:"ttlSeconds"`
+	Metadata       map[string]string    `json:"metadata"`
+	HealthPolicy   *healthPolicyRequest `json:"healthPolicy"`
+	MaxConcurrency *int                 `json:"maxConcurrency"`
 }
 
 func (r *registerRequest) valid() bool {
@@ -40,6 +41,9 @@ func (r *registerRequest) valid() bool {
 		return false
 	}
 	if r.Weight < 1 || r.Weight > 100 || r.TTLSeconds < 1 || r.TTLSeconds > 300 {
+		return false
+	}
+	if r.MaxConcurrency != nil && (*r.MaxConcurrency < 1 || *r.MaxConcurrency > 10000) {
 		return false
 	}
 	for k, v := range r.Metadata {
@@ -62,31 +66,35 @@ func (r *registerRequest) valid() bool {
 
 // instanceView is the public representation of a registered instance. The
 // lease token is deliberately excluded; it only appears in registerResponse.
+// MaxConcurrency is omitted for instances registered without a cap, where
+// concurrency is unbounded.
 type instanceView struct {
-	Service      string            `json:"service"`
-	Instance     string            `json:"instance"`
-	Endpoint     string            `json:"endpoint"`
-	Version      string            `json:"version"`
-	Zone         string            `json:"zone"`
-	Weight       int               `json:"weight"`
-	TTLSeconds   int               `json:"ttlSeconds"`
-	Metadata     map[string]string `json:"metadata"`
-	ExpiresAt    string            `json:"expiresAt"`
-	HealthStatus string            `json:"healthStatus"`
+	Service        string            `json:"service"`
+	Instance       string            `json:"instance"`
+	Endpoint       string            `json:"endpoint"`
+	Version        string            `json:"version"`
+	Zone           string            `json:"zone"`
+	Weight         int               `json:"weight"`
+	TTLSeconds     int               `json:"ttlSeconds"`
+	Metadata       map[string]string `json:"metadata"`
+	ExpiresAt      string            `json:"expiresAt"`
+	HealthStatus   string            `json:"healthStatus"`
+	MaxConcurrency int               `json:"maxConcurrency,omitempty"`
 }
 
 func viewOf(inst instance) instanceView {
 	return instanceView{
-		Service:      inst.Service,
-		Instance:     inst.Instance,
-		Endpoint:     inst.Endpoint,
-		Version:      inst.Version,
-		Zone:         inst.Zone,
-		Weight:       inst.Weight,
-		TTLSeconds:   inst.TTLSeconds,
-		Metadata:     inst.Metadata,
-		ExpiresAt:    inst.expiresAt.UTC().Format(time.RFC3339),
-		HealthStatus: inst.healthStatus(),
+		Service:        inst.Service,
+		Instance:       inst.Instance,
+		Endpoint:       inst.Endpoint,
+		Version:        inst.Version,
+		Zone:           inst.Zone,
+		Weight:         inst.Weight,
+		TTLSeconds:     inst.TTLSeconds,
+		Metadata:       inst.Metadata,
+		ExpiresAt:      inst.expiresAt.UTC().Format(time.RFC3339),
+		HealthStatus:   inst.healthStatus(),
+		MaxConcurrency: inst.MaxConcurrency,
 	}
 }
 
@@ -155,6 +163,9 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Weight:     req.Weight,
 		TTLSeconds: req.TTLSeconds,
 		Metadata:   metadata,
+	}
+	if req.MaxConcurrency != nil {
+		inst.MaxConcurrency = *req.MaxConcurrency
 	}
 	if p := req.HealthPolicy; p != nil {
 		inst.health = healthState{
