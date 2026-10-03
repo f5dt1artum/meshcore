@@ -19,6 +19,7 @@ var (
 	errStaleHealthReport    = errors.New("stale health report")
 	errNoRoutableInstance   = errors.New("no routable instance")
 	errConcurrencyLimited   = errors.New("concurrency limited")
+	errRateLimited          = errors.New("rate limited")
 	errCircuitOpen          = errors.New("circuit open")
 	errPermitNotFound       = errors.New("permit not found")
 	errInvalidCompletion    = errors.New("invalid completion")
@@ -54,6 +55,39 @@ const (
 	circuitOpen     = "open"
 	circuitHalfOpen = "half_open"
 )
+
+// rateLimitState tracks the optional local token bucket of an instance.
+// Tokens refill continuously at requestsPerSecond up to the burst cap; the
+// balance may hold a fractional part but only whole tokens can be spent. The
+// zero value is the unconfigured state: no bucket, never limited.
+type rateLimitState struct {
+	configured        bool
+	requestsPerSecond int
+	burst             int
+
+	tokens     float64
+	lastRefill time.Time
+}
+
+// refill advances the bucket to now, crediting the tokens earned since the
+// last refill and capping the balance at burst. Callers must hold r.mu.
+func (rl *rateLimitState) refill(now time.Time) {
+	if !rl.configured || !now.After(rl.lastRefill) {
+		return
+	}
+	rl.tokens += now.Sub(rl.lastRefill).Seconds() * float64(rl.requestsPerSecond)
+	if rl.tokens > float64(rl.burst) {
+		rl.tokens = float64(rl.burst)
+	}
+	rl.lastRefill = now
+}
+
+// hasToken reports whether at least one whole token is available at now,
+// refilling first. It never spends a token. Callers must hold r.mu.
+func (rl *rateLimitState) hasToken(now time.Time) bool {
+	rl.refill(now)
+	return rl.tokens >= 1
+}
 
 // circuitState tracks the optional circuit breaker policy of an instance.
 // Consecutive failed completions in the closed state open the circuit for
@@ -113,6 +147,7 @@ type instance struct {
 	expiresAt time.Time
 	health    healthState
 	circuit   circuitState
+	rateLimit rateLimitState
 }
 
 func (i *instance) live(now time.Time) bool { return now.Before(i.expiresAt) }
@@ -179,6 +214,11 @@ func (r *registry) register(inst *instance, now time.Time) (instance, bool) {
 	defer r.mu.Unlock()
 	inst.token = newLeaseToken()
 	inst.expiresAt = now.Add(time.Duration(inst.TTLSeconds) * time.Second)
+	if inst.rateLimit.configured {
+		// Every registration, first or overwrite, starts from a full bucket.
+		inst.rateLimit.tokens = float64(inst.rateLimit.burst)
+		inst.rateLimit.lastRefill = now
+	}
 	byName, ok := r.instances[inst.Service]
 	if !ok {
 		byName = make(map[string]*instance)
@@ -393,14 +433,20 @@ type acquiredPermit struct {
 // slot on it. Candidates are the live, non-unhealthy instances of service
 // matching the version/zone filters, ranked by the same weighted rendezvous
 // score used by resolve, best first; the first-ranked candidate with a free
-// slot wins. Unbounded instances (MaxConcurrency == 0) always admit.
-// Instances whose circuit is open, or half-open with a probe already out,
-// are skipped in rank order; a half-open circuit grants its single probe
-// permit to the first acquire that reaches it. The lookup and the occupancy
-// happen under one lock, so the number of valid permits can never exceed an
-// instance's quota. It returns errNoRoutableInstance when the filter matches
-// nothing, errCircuitOpen when every match is blocked only by its circuit,
-// and errConcurrencyLimited when every circuit-passing match is at capacity.
+// slot and, when rate-limited, a whole token available wins. Unbounded
+// instances (MaxConcurrency == 0) always have a slot; instances without a
+// rateLimit policy always have a token. Instances whose circuit is open, or
+// half-open with a probe already out, are skipped in rank order; a half-open
+// circuit grants its single probe permit to the first acquire that reaches
+// it. The lookup, the token spend and the occupancy happen under one lock,
+// so the number of valid permits can never exceed an instance's quota and
+// concurrent acquires can never overspend a bucket. Checking or skipping a
+// candidate costs no token; only the chosen instance is charged, exactly one
+// token. It returns errNoRoutableInstance when the filter matches nothing,
+// errCircuitOpen when every match is blocked only by its circuit,
+// errConcurrencyLimited when every circuit-passing match is at capacity, and
+// errRateLimited when every circuit-passing match with a free slot lacks a
+// whole token.
 func (r *registry) acquire(service, key, version, zone string, ttl time.Duration, now time.Time) (acquiredPermit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -453,15 +499,27 @@ func (r *registry) acquire(service, key, version, zone string, ttl time.Duration
 	}
 
 	var chosen *eligible
+	sawFreeSlot := false
 	for i := range passing {
 		cand := passing[i].inst
-		if cand.MaxConcurrency == 0 || r.inUse[cand] < cand.MaxConcurrency {
-			chosen = &passing[i]
-			break
+		if cand.MaxConcurrency != 0 && r.inUse[cand] >= cand.MaxConcurrency {
+			continue
 		}
+		sawFreeSlot = true
+		if cand.rateLimit.configured && !cand.rateLimit.hasToken(now) {
+			continue
+		}
+		chosen = &passing[i]
+		break
 	}
 	if chosen == nil {
-		return acquiredPermit{}, errConcurrencyLimited
+		if !sawFreeSlot {
+			return acquiredPermit{}, errConcurrencyLimited
+		}
+		return acquiredPermit{}, errRateLimited
+	}
+	if chosen.inst.rateLimit.configured {
+		chosen.inst.rateLimit.tokens--
 	}
 
 	token := newPermitToken()
