@@ -51,5 +51,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("/v1/services/{service}/instances/{instance}/health", s.handleHealth)
 	mux.HandleFunc("/v1/discovery/{service}", s.handleDiscovery)
 	mux.HandleFunc("/v1/resolve/{service}", s.handleResolve)
+	mux.HandleFunc("/v1/admission/{service}/acquire", s.handleAcquire)
+	mux.HandleFunc("/v1/admission/{service}/permits/{permitToken}", s.handlePermit)
 	return mux
 }

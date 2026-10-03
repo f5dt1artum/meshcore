@@ -54,10 +54,16 @@ type instance struct {
 	Weight     int
 	TTLSeconds int
 	Metadata   map[string]string
+	// MaxConcurrency caps the number of simultaneously valid admission
+	// permits; nil means unlimited.
+	MaxConcurrency *int
 
 	token     string
 	expiresAt time.Time
 	health    healthState
+	// permits maps permit token to permit expiry. It is replaced wholesale
+	// on overwrite, so permits of a superseded record die with it.
+	permits map[string]time.Time
 }
 
 func (i *instance) live(now time.Time) bool { return now.Before(i.expiresAt) }
@@ -101,6 +107,7 @@ func (r *registry) register(inst *instance, now time.Time) (instance, bool) {
 	defer r.mu.Unlock()
 	inst.token = newLeaseToken()
 	inst.expiresAt = now.Add(time.Duration(inst.TTLSeconds) * time.Second)
+	inst.permits = make(map[string]time.Time)
 	byName, ok := r.instances[inst.Service]
 	if !ok {
 		byName = make(map[string]*instance)
