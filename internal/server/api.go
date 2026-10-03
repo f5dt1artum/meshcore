@@ -25,15 +25,25 @@ type healthPolicyRequest struct {
 	SuccessThreshold *int `json:"successThreshold"`
 }
 
+// circuitBreakerRequest configures the optional per-instance circuit
+// breaker. Both fields are required integers: failureThreshold 1-20 opens
+// the breaker after that many consecutive permit failures, openSeconds 1-300
+// is how long the breaker stays open before offering a single trial permit.
+type circuitBreakerRequest struct {
+	FailureThreshold *int `json:"failureThreshold"`
+	OpenSeconds      *int `json:"openSeconds"`
+}
+
 type registerRequest struct {
-	Endpoint       string               `json:"endpoint"`
-	Version        string               `json:"version"`
-	Zone           string               `json:"zone"`
-	Weight         int                  `json:"weight"`
-	TTLSeconds     int                  `json:"ttlSeconds"`
-	Metadata       map[string]string    `json:"metadata"`
-	HealthPolicy   *healthPolicyRequest `json:"healthPolicy"`
-	MaxConcurrency *int                 `json:"maxConcurrency"`
+	Endpoint       string                 `json:"endpoint"`
+	Version        string                 `json:"version"`
+	Zone           string                 `json:"zone"`
+	Weight         int                    `json:"weight"`
+	TTLSeconds     int                    `json:"ttlSeconds"`
+	Metadata       map[string]string      `json:"metadata"`
+	HealthPolicy   *healthPolicyRequest   `json:"healthPolicy"`
+	MaxConcurrency *int                   `json:"maxConcurrency"`
+	CircuitBreaker *circuitBreakerRequest `json:"circuitBreaker"`
 }
 
 func (r *registerRequest) valid() bool {
@@ -58,6 +68,15 @@ func (r *registerRequest) valid() bool {
 		}
 		if *p.FailureThreshold < 1 || *p.FailureThreshold > 10 ||
 			*p.SuccessThreshold < 1 || *p.SuccessThreshold > 10 {
+			return false
+		}
+	}
+	if c := r.CircuitBreaker; c != nil {
+		if c.FailureThreshold == nil || c.OpenSeconds == nil {
+			return false
+		}
+		if *c.FailureThreshold < 1 || *c.FailureThreshold > 20 ||
+			*c.OpenSeconds < 1 || *c.OpenSeconds > 300 {
 			return false
 		}
 	}
@@ -173,6 +192,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			failureThreshold: *p.FailureThreshold,
 			successThreshold: *p.SuccessThreshold,
 			status:           healthHealthy,
+		}
+	}
+	if c := req.CircuitBreaker; c != nil {
+		inst.breaker = breakerState{
+			configured:       true,
+			failureThreshold: *c.FailureThreshold,
+			openSeconds:      *c.OpenSeconds,
+			status:           breakerClosed,
 		}
 	}
 	stored, overwritten := s.registry.register(inst, s.now())

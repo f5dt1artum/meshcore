@@ -86,6 +86,8 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		})
 	case errors.Is(err, errNoRoutableInstance):
 		writeError(w, http.StatusServiceUnavailable, "no_available_instance")
+	case errors.Is(err, errCircuitOpen):
+		writeError(w, http.StatusServiceUnavailable, "circuit_open")
 	case errors.Is(err, errConcurrencyLimited):
 		writeError(w, http.StatusTooManyRequests, "concurrency_limited")
 	default:
@@ -109,6 +111,45 @@ func (s *server) handlePermit(w http.ResponseWriter, r *http.Request) {
 	}
 	token := r.PathValue("permitToken")
 	err := s.registry.release(service, token, s.now())
+	if err != nil {
+		writeError(w, http.StatusNotFound, "permit_not_found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// completeRequest is the body of POST .../permits/{token}/complete; outcome
+// is the only accepted field and must be "success" or "failure".
+type completeRequest struct {
+	Outcome string `json:"outcome"`
+}
+
+// handleComplete serves POST
+// /v1/admission/{service}/permits/{permitToken}/complete. A valid permit is
+// finished: its concurrency slot is freed immediately, the token is dead for
+// any further complete or DELETE, and the outcome drives the instance's
+// circuit breaker.
+func (s *server) handleComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	service := r.PathValue("service")
+	if !validName(service) {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	var req completeRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || dec.Decode(&struct{}{}) != io.EOF ||
+		(req.Outcome != "success" && req.Outcome != "failure") {
+		writeError(w, http.StatusBadRequest, "validation_error")
+		return
+	}
+	token := r.PathValue("permitToken")
+	err := s.registry.complete(service, token, req.Outcome == "success", s.now())
 	if err != nil {
 		writeError(w, http.StatusNotFound, "permit_not_found")
 		return

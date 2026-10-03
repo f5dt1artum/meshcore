@@ -19,6 +19,7 @@ var (
 	errStaleHealthReport    = errors.New("stale health report")
 	errNoRoutableInstance   = errors.New("no routable instance")
 	errConcurrencyLimited   = errors.New("concurrency limited")
+	errCircuitOpen          = errors.New("circuit open")
 	errPermitNotFound       = errors.New("permit not found")
 )
 
@@ -27,6 +28,15 @@ const (
 	healthDisabled  = "disabled"
 	healthHealthy   = "healthy"
 	healthUnhealthy = "unhealthy"
+)
+
+// Per-instance circuit-breaker states. The breaker is independent of the
+// health policy: it tracks permit outcomes rather than health reports, is
+// invisible to discovery and resolve, and never changes healthStatus.
+const (
+	breakerClosed   = "closed"
+	breakerOpen     = "open"
+	breakerHalfOpen = "half_open"
 )
 
 // healthState tracks the optional health policy of an instance and the
@@ -43,6 +53,21 @@ type healthState struct {
 	lastSequence    int64
 	lastStatusPass  bool
 	hasSequence     bool
+}
+
+// breakerState is the optional per-instance circuit breaker. The zero value
+// is the disabled state: no breaker configured, admission is unaffected. A
+// configured breaker starts closed; consecutive permit failures open it. The
+// breaker is evaluated lazily against the caller's clock, so an open breaker
+// flips to half_open exactly when openSeconds elapse without any timer.
+type breakerState struct {
+	configured       bool
+	failureThreshold int
+	openSeconds      int
+
+	status          string // breakerClosed, breakerOpen or breakerHalfOpen
+	consecutiveFail int
+	openedAt        time.Time // when the current open period started
 }
 
 // instance is one registered service instance plus its lease state. The
@@ -62,6 +87,7 @@ type instance struct {
 	token     string
 	expiresAt time.Time
 	health    healthState
+	breaker   breakerState
 }
 
 func (i *instance) live(now time.Time) bool { return now.Before(i.expiresAt) }
@@ -79,12 +105,16 @@ func (i *instance) healthStatus() string {
 // permit is one outstanding short-lived admission permit. It references the
 // exact instance record it was granted against, so overwriting,
 // deregistering or losing the lease of that record invalidates the permit
-// immediately even though the permit itself has not yet expired.
+// immediately even though the permit itself has not yet expired. probe marks
+// the single trial permit a half_open breaker hands out while its outcome is
+// pending; no further permit may be granted to that instance until the trial
+// ends.
 type permit struct {
 	token     string
 	service   string
 	inst      *instance
 	expiresAt time.Time
+	probe     bool
 }
 
 // registry holds all live and expired-but-unpurged instances. Expiration is
@@ -270,30 +300,46 @@ func (r *registry) snapshot(service, version, zone string, now time.Time) []inst
 	return out
 }
 
+// openBreakerLocked starts a fresh open period on a configured breaker and
+// clears the closed-state failure counter. Callers must hold r.mu.
+func openBreakerLocked(b *breakerState, now time.Time) {
+	b.status = breakerOpen
+	b.openedAt = now
+	b.consecutiveFail = 0
+}
+
 // dropPermitLocked removes one permit and releases the quota it occupied on
 // its instance. Callers must hold r.mu.
 func (r *registry) dropPermitLocked(p *permit) {
 	delete(r.permits, p.token)
-	if n := r.inUse[p.inst] - 1; n > 0 {
-		r.inUse[p.inst] = n
+	r.decInUseLocked(p.inst)
+}
+
+// decInUseLocked gives back one occupied concurrency slot on inst. Callers
+// must hold r.mu.
+func (r *registry) decInUseLocked(inst *instance) {
+	if n := r.inUse[inst] - 1; n > 0 {
+		r.inUse[inst] = n
 	} else {
-		delete(r.inUse, p.inst)
+		delete(r.inUse, inst)
 	}
 }
 
 // prunePermitsLocked discards every permit that is no longer valid at now:
 // permits past their own expiry and permits bound to an instance whose lease
 // has expired. Overwritten and deregistered instances are removed eagerly by
-// their callers. Callers must hold r.mu.
+// their callers. A trial permit whose time ran out restarts the open period
+// of its breaker; losing the instance lease discards the breaker with the
+// record, so no transition is needed. Callers must hold r.mu.
 func (r *registry) prunePermitsLocked(now time.Time) {
 	for token, p := range r.permits {
-		if !now.Before(p.expiresAt) || !p.inst.live(now) {
-			delete(r.permits, token)
-			if n := r.inUse[p.inst] - 1; n > 0 {
-				r.inUse[p.inst] = n
-			} else {
-				delete(r.inUse, p.inst)
-			}
+		if now.Before(p.expiresAt) && p.inst.live(now) {
+			continue
+		}
+		delete(r.permits, token)
+		r.decInUseLocked(p.inst)
+		if p.probe && p.inst.breaker.configured && p.inst.live(now) {
+			openBreakerLocked(&p.inst.breaker, now)
 		}
 	}
 }
@@ -307,11 +353,7 @@ func (r *registry) invalidatePermitsLocked(inst *instance) {
 			continue
 		}
 		delete(r.permits, token)
-		if n := r.inUse[inst] - 1; n > 0 {
-			r.inUse[inst] = n
-		} else {
-			delete(r.inUse, inst)
-		}
+		r.decInUseLocked(inst)
 	}
 }
 
@@ -329,9 +371,18 @@ type acquiredPermit struct {
 // score used by resolve, best first; the first-ranked candidate with a free
 // slot wins. Unbounded instances (MaxConcurrency == 0) always admit. The
 // lookup and the occupancy happen under one lock, so the number of valid
-// permits can never exceed an instance's quota. It returns
-// errNoRoutableInstance when the filter matches nothing and
-// errConcurrencyLimited when every match is at capacity.
+// permits can never exceed an instance's quota.
+//
+// Circuit breakers only winnow admission; they never affect discovery or
+// resolve. Candidates are still walked in ranked order. An open breaker
+// skips its instance; a half_open breaker with an outstanding trial permit
+// skips it too; a half_open breaker without one is breaker-eligible and, if
+// the candidate has a free concurrency slot, receives the single trial
+// permit. The open-to-half_open flip happens lazily on the first acquire at
+// or after openSeconds. acquire returns errNoRoutableInstance when the
+// filter matches no live, healthy instance, errCircuitOpen when every match
+// is stopped solely by its breaker, and errConcurrencyLimited when at least
+// one match passes its breaker check but all such matches are at capacity.
 func (r *registry) acquire(service, key, version, zone string, ttl time.Duration, now time.Time) (acquiredPermit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -368,13 +419,43 @@ func (r *registry) acquire(service, key, version, zone string, ttl time.Duration
 	})
 
 	var chosen *instance
+	probe := false
+	allBreakerBlocked := true
 	for _, cand := range candidates {
+		willProbe := false
+		if cand.breaker.configured {
+			b := &cand.breaker
+			if b.status == breakerOpen {
+				// The open period ends lazily: the first admission attempt at
+				// or after openSeconds turns the breaker into half_open.
+				if !now.Before(b.openedAt.Add(time.Duration(b.openSeconds) * time.Second)) {
+					b.status = breakerHalfOpen
+				} else {
+					continue // blocked only by the breaker
+				}
+			}
+			if b.status == breakerHalfOpen {
+				// At most one trial permit may be outstanding; a pending
+				// trial blocks the instance on breaker grounds alone.
+				if r.hasProbeLocked(cand) {
+					continue
+				}
+				willProbe = true
+			}
+		}
+		// This candidate passed the breaker check; ranking and the normal
+		// concurrency semantics still decide whether it admits now.
+		allBreakerBlocked = false
 		if cand.MaxConcurrency == 0 || r.inUse[cand] < cand.MaxConcurrency {
 			chosen = cand
+			probe = willProbe
 			break
 		}
 	}
 	if chosen == nil {
+		if allBreakerBlocked {
+			return acquiredPermit{}, errCircuitOpen
+		}
 		return acquiredPermit{}, errConcurrencyLimited
 	}
 
@@ -391,14 +472,28 @@ func (r *registry) acquire(service, key, version, zone string, ttl time.Duration
 		service:   service,
 		inst:      chosen,
 		expiresAt: expiresAt,
+		probe:     probe,
 	}
 	r.inUse[chosen]++
 	return acquiredPermit{inst: *chosen, token: token, expiresAt: expiresAt}, nil
 }
 
+// hasProbeLocked reports whether inst currently has an outstanding trial
+// permit. Callers must hold r.mu.
+func (r *registry) hasProbeLocked(inst *instance) bool {
+	for _, p := range r.permits {
+		if p.inst == inst && p.probe {
+			return true
+		}
+	}
+	return false
+}
+
 // release releases a valid permit granted for service. Unknown tokens,
 // expired permits, tokens bound to another service and permits invalidated
 // by overwrite, deregistration or lease expiry all return errPermitNotFound.
+// Releasing a half_open trial permit without an outcome restarts the open
+// period; releasing a normal permit never touches the breaker.
 func (r *registry) release(service, token string, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -406,6 +501,53 @@ func (r *registry) release(service, token string, now time.Time) error {
 	p, ok := r.permits[token]
 	if !ok || p.service != service {
 		return errPermitNotFound
+	}
+	if p.probe && p.inst.breaker.configured {
+		openBreakerLocked(&p.inst.breaker, now)
+	}
+	r.dropPermitLocked(p)
+	return nil
+}
+
+// complete reports the outcome of a valid permit granted for service and
+// releases it. The lookup rules mirror release: unknown, expired,
+// wrong-service or invalidated permits all return errPermitNotFound, so a
+// repeat completion and a later DELETE both 404.
+//
+// Outcomes drive only a configured breaker. In closed state completions are
+// applied in acceptance order: success clears the consecutive-failure
+// counter, failure increments it and opens the breaker at the threshold.
+// Completions of permits that were outstanding while the breaker is open
+// only free quota. A half_open trial permit's success closes and resets the
+// breaker; its failure starts a fresh open period.
+func (r *registry) complete(service, token string, success bool, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prunePermitsLocked(now)
+	p, ok := r.permits[token]
+	if !ok || p.service != service {
+		return errPermitNotFound
+	}
+	b := &p.inst.breaker
+	if b.configured {
+		switch {
+		case p.probe:
+			if success {
+				b.status = breakerClosed
+				b.consecutiveFail = 0
+			} else {
+				openBreakerLocked(b, now)
+			}
+		case b.status == breakerClosed:
+			if success {
+				b.consecutiveFail = 0
+			} else {
+				b.consecutiveFail++
+				if b.consecutiveFail >= b.failureThreshold {
+					openBreakerLocked(b, now)
+				}
+			}
+		}
 	}
 	r.dropPermitLocked(p)
 	return nil
